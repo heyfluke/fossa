@@ -3012,6 +3012,11 @@ static const char *parse_http_headers(const char *s, const char *end, int len,
       req->body.len = to64(v->p);
       req->message.len = len + req->body.len;
     }
+
+    if (!ns_ncasecmp(k->p, "Transfer-Encoding", 17) &&
+        !ns_ncasecmp(v->p, "chunked", 7)) {
+      req->is_chunked = 1;
+    }
   }
 
   return s;
@@ -3027,6 +3032,8 @@ int ns_parse_http(const char *s, int n, struct http_message *hm, int is_req) {
   hm->message.p = s;
   hm->body.p = s + len;
   hm->message.len = hm->body.len = (size_t) ~0;
+  hm->is_chunked = 0;  // default.
+  hm->chunked_finished = 0;
   end = s + len;
 
   /* Request is fully buffered. Skip leading whitespaces. */
@@ -3376,11 +3383,22 @@ static void transfer_file_data(struct ns_connection *nc) {
   }
 }
 
-static void handle_chunked(struct http_message *hm, char *buf, size_t len) {
+static int handle_chunked(struct http_message *hm, unsigned char *buf, size_t len) {
   unsigned char *s = (unsigned char *) buf, *p = s;
   unsigned char *end = s + len;
 
+  int data_consumed = 0;
+
   while (s < end) {
+
+    if (s < end && *s == '\r') s++;
+    if (s < end && *s == '\n') s++;
+
+    char *r = strstr(s, "\r\n");
+    if (!r) {
+      goto end;
+    }
+
     size_t chunk_len = 0;
     while (s < end && isxdigit(*s)) {
       chunk_len *= 16;
@@ -3389,20 +3407,33 @@ static void handle_chunked(struct http_message *hm, char *buf, size_t len) {
     }
     if (s < end && *s == '\r') s++;
     if (s < end && *s == '\n') s++;
-    memmove(p, s, chunk_len);
-    p += chunk_len;
-    s += chunk_len;
+
+    // FIXME: remember last chunk size. return data ASAP
+    if (end - s < chunk_len) {
+      goto end;
+    } else {
+      memmove(p, s, chunk_len);
+      p += chunk_len;
+      s += chunk_len;
+      data_consumed = (int)(s-buf);
+    }
 
     if (chunk_len == 0) {
-      /* Last chunk. Set body length to reassembled length */
-      hm->body.len = (char *) p - buf;
-
-      /* Set message length to non-reassembled length and zero-out trailing */
-      hm->message.len = (char *) s - hm->message.p;
-      memset(p, 0, s - p);
+      hm->chunked_finished = 1;
+      goto end;
       break;
     }
-  }
+  } // while
+
+end:
+  /* Last chunk. Set body length to reassembled length */
+  hm->body.len = p - buf;
+
+  /* Set message length to non-reassembled length and zero-out trailing */
+  hm->message.len = (char *) s - hm->message.p;
+  // memset(p, 0, s - p);
+
+  return data_consumed;
 }
 
 static void http_handler(struct ns_connection *nc, int ev, void *ev_data) {
@@ -3434,10 +3465,16 @@ static void http_handler(struct ns_connection *nc, int ev, void *ev_data) {
     struct ns_str *s;
     req_len = ns_parse_http(io->buf, io->len, &hm, is_req);
 
+    int data_consumed = 0; // for handling chunked data.
+
     if (req_len > 0 &&
-        (s = ns_get_http_header(&hm, "Transfer-Encoding")) != NULL &&
-        ns_vcasecmp(s, "chunked") == 0) {
-      handle_chunked(&hm, io->buf + req_len, io->len - req_len);
+        /*(s = ns_get_http_header(&hm, "Transfer-Encoding")) != NULL &&
+        ns_vcasecmp(s, "chunked") == 0*/ hm.is_chunked) {
+      data_consumed = handle_chunked(&hm, io->buf + req_len, io->len - req_len);
+      // move the unhandled data to the beginning of body.
+#if DEBUG_LOG
+      printf("data_consumed = %d\n", data_consumed);
+#endif // DEBUG_LOG
     }
 
     if (req_len < 0 || (req_len == 0 && io->len >= NS_MAX_HTTP_REQUEST_SIZE)) {
@@ -3469,10 +3506,15 @@ static void http_handler(struct ns_connection *nc, int ev, void *ev_data) {
         nc->handler(nc, NS_WEBSOCKET_HANDSHAKE_DONE, NULL);
         websocket_handler(nc, NS_RECV, ev_data);
       }
-    } else if (hm.message.len <= io->len) {
+    } else if (hm.message.len /*<=*/ == io->len || hm.is_chunked) {
       /* Whole HTTP message is fully buffered, call event handler */
       nc->handler(nc, nc->listener ? NS_HTTP_REQUEST : NS_HTTP_REPLY, &hm);
-      mbuf_remove(io, hm.message.len);
+      if(!hm.is_chunked || hm.chunked_finished) {
+        mbuf_remove(io, hm.message.len);  // FIXME: consumed length
+      } else if (hm.is_chunked) {
+        memmove(io->buf + req_len, io->buf + req_len + data_consumed, io->len - req_len - data_consumed);
+        io->len -= data_consumed;
+      }
     }
   }
 }

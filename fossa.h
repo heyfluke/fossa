@@ -1183,6 +1183,9 @@ struct http_message {
   struct ns_str uri;    /* "/my_file.html" */
   /* For responses, code and response status message are set */
   int resp_code;
+  int is_chunked;
+  // FIXME add int chunk_size;  // current chunk remaining size. -1: not chunked, 0:current chunk no data.
+  int chunked_finished;
   struct ns_str resp_status_msg;
 
   /*
